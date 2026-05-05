@@ -1,4 +1,5 @@
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use std::collections::BTreeSet;
 
 use revm::{
     bytecode::Bytecode,
@@ -8,6 +9,56 @@ use revm::{
     state::AccountInfo,
     ExecuteEvm, MainBuilder, MainContext,
 };
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ReadRecord {
+    Basic { address: Address },
+    CodeByHash { code_hash: B256 },
+    Storage { address: Address, slot: U256 },
+    BlockHash { number: u64 },
+}
+
+struct TracingDb<DB> {
+    inner: DB,
+    reads: Vec<ReadRecord>,
+}
+
+impl<DB> TracingDb<DB> {
+    fn new(inner: DB) -> Self {
+        Self {
+            inner,
+            reads: Vec::new(),
+        }
+    }
+}
+
+impl<DB> revm::database::Database for TracingDb<DB>
+where
+    DB: revm::database::Database,
+{
+    type Error = DB::Error;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.reads.push(ReadRecord::Basic { address });
+        self.inner.basic(address)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.reads.push(ReadRecord::CodeByHash { code_hash });
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, slot: U256) -> Result<U256, Self::Error> {
+        self.reads.push(ReadRecord::Storage { address, slot });
+        self.inner.storage(address, slot)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.reads.push(ReadRecord::BlockHash { number });
+        self.inner.block_hash(number)
+    }
+}
 
 fn minimal_erc20_transfer_bytecode() -> Bytecode {
     Bytecode::new_raw(
@@ -137,7 +188,9 @@ fn main() {
         ..Default::default()
     };
 
-    let mut evm = Context::mainnet().with_db(db).build_mainnet();
+    let tracing_db = TracingDb::new(db);
+
+    let mut evm = Context::mainnet().with_db(tracing_db).build_mainnet();
 
     let result = evm.transact(tx).unwrap();
 
@@ -175,5 +228,56 @@ fn main() {
         "recipient token balance: {} -> {}",
         recipient_slot.original_value(),
         recipient_slot.present_value()
+    );
+
+    let reads = &evm.ctx.journaled_state.database.reads;
+
+    println!("\nread-set:");
+    for read in reads {
+        println!("{read:?}");
+    }
+
+    let read_storage_slots: BTreeSet<(Address, U256)> = reads
+        .iter()
+        .filter_map(|read| match read {
+            ReadRecord::Storage { address, slot } => Some((*address, *slot)),
+            _ => None,
+        })
+        .collect();
+
+    let expected_slots = BTreeSet::from([
+        (erc20, sender_balance_slot),
+        (erc20, recipient_balance_slot),
+    ]);
+
+    assert_eq!(
+        read_storage_slots, expected_slots,
+        "ERC20 transfer should read exactly sender and recipient balance slots"
+    );
+
+    let erc20_account = result
+        .state
+        .get(&erc20)
+        .expect("erc20 account should be touched");
+
+    let written_storage_slots: BTreeSet<(Address, U256)> = erc20_account
+        .storage
+        .keys()
+        .map(|slot| (erc20, *slot))
+        .collect();
+
+    println!("\nwrite-set:");
+    for (address, slot) in &written_storage_slots {
+        let value = &result.state[address].storage[slot];
+        println!(
+            "address={address:?} slot={slot} original={} present={}",
+            value.original_value(),
+            value.present_value()
+        );
+    }
+
+    assert_eq!(
+        written_storage_slots, expected_slots,
+        "ERC20 transfer should write exactly sender and recipient balance slots"
     );
 }
